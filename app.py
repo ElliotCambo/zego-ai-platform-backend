@@ -211,16 +211,67 @@ async def list_n8n_pods(
                 if pods_response.status_code == 200:
                     pods = pods_response.json()
                     for pod in pods:
-                        # Get pod status from Kubernetes
-                        status = await get_pod_status(pod.get("container_name", ""))
-                        traefik_port = os.getenv("TRAEFIK_NODEPORT", "30080")
+                        # Get detailed pod status from Kubernetes
+                        pod_info = await get_pod_status_and_info(pod.get("container_name", ""))
+                        
+                        # Determine URL based on environment
+                        # In AWS, try to get LoadBalancer hostname from service
+                        aws_region = os.getenv("AWS_REGION")
+                        url = None
+                        
+                        if aws_region:
+                            # AWS: Try to get LoadBalancer hostname from service
+                            try:
+                                service_name = pod.get("container_name", f"n8n-{pod['subdomain']}")
+                                import httpx
+                                k8s_api_url = os.getenv("KUBERNETES_SERVICE_HOST")
+                                if k8s_api_url:
+                                    # Query Kubernetes API for service LoadBalancer hostname
+                                    # For now, fetch from pod-spawner or directly query service
+                                    # This will be populated by pod-spawner
+                                    pass
+                            except Exception:
+                                pass
+                        
+                        # Always try to get LoadBalancer hostname from Kubernetes service
+                        try:
+                            service_name = pod.get("container_name", f"n8n-{pod['subdomain']}")
+                            # Query Kubernetes API for service
+                            from kubernetes import client as k8s_client, config as k8s_config
+                            try:
+                                k8s_config.load_incluster_config()
+                            except:
+                                k8s_config.load_kube_config()
+                            v1 = k8s_client.CoreV1Api()
+                            namespace = os.getenv("KUBERNETES_NAMESPACE", "zego-ai-platform")
+                            service = v1.read_namespaced_service(
+                                name=service_name,
+                                namespace=namespace
+                            )
+                            # Check if service has LoadBalancer hostname
+                            if (service.status.load_balancer and 
+                                service.status.load_balancer.ingress and 
+                                len(service.status.load_balancer.ingress) > 0):
+                                lb_hostname = service.status.load_balancer.ingress[0].hostname
+                                if lb_hostname:
+                                    url = f"http://{lb_hostname}"
+                        except Exception as e:
+                            logger.debug(f"Could not get LoadBalancer hostname for {service_name}: {e}")
+                        
+                        # Fallback: Construct URL from domain/env if no LoadBalancer
+                        if not url:
+                            n8n_base_domain = os.getenv("N8N_BASE_DOMAIN", "localhost")
+                            traefik_port = os.getenv("TRAEFIK_NODEPORT", "30080")
+                            url = f"http://{pod['subdomain']}.n8n.{n8n_base_domain}:{traefik_port}"
+                        
                         pods_list.append({
                             "id": pod["id"],
                             "name": pod["name"],
                             "department_name": dept["name"],
                             "subdomain": pod["subdomain"],
-                            "url": f"http://{pod['subdomain']}.n8n.{os.getenv('N8N_BASE_DOMAIN', 'localhost')}:{traefik_port}",
-                            "status": status,
+                            "url": url,
+                            "status": pod_info.get("status", "unknown"),
+                            "container_id": pod_info.get("container_id"),
                             "created_at": pod["created_at"],
                             "enabled_nodes": pod.get("nodes_exclude", "")
                         })
@@ -285,6 +336,46 @@ async def create_n8n_pod(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/n8n-pods/{pod_id}/status")
+async def get_n8n_pod_status(
+    pod_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get detailed status of an n8n pod from Kubernetes"""
+    import httpx
+    pod_spawner_url = os.getenv("POD_SPAWNER_URL", "http://zego-pod-spawner:4005")
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Get pod info from pod-spawner
+            pod_response = await client.get(f"{pod_spawner_url}/api/v1/pods/{pod_id}")
+            if pod_response.status_code != 200:
+                raise HTTPException(status_code=404, detail="Pod not found")
+            
+            pod_data = pod_response.json()
+            container_name = pod_data.get("container_name", "")
+            
+            # Get detailed status from Kubernetes
+            pod_info = await get_pod_status_and_info(container_name)
+            
+            return {
+                "pod_id": pod_id,
+                "container_name": container_name,
+                "status": pod_info.get("status"),
+                "container_id": pod_info.get("container_id"),
+                "ready": pod_info.get("ready"),
+                "restart_count": pod_info.get("restart_count"),
+                "message": pod_info.get("message"),
+                "pod_name": pod_info.get("pod_name")
+            }
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        logger.error(f"Error getting pod status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/api/n8n-pods/{pod_id}")
 async def delete_n8n_pod(
     pod_id: int,
@@ -317,30 +408,88 @@ async def delete_n8n_pod(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def get_pod_status(pod_name: str) -> str:
-    """Get pod status from Kubernetes"""
+async def get_pod_status_and_info(pod_name: str) -> dict:
+    """Get pod status and detailed info from Kubernetes
+    
+    Returns:
+        dict with keys: status, container_id, ready, restart_count, message
+    """
     try:
-        from kubernetes import client, config
+        from kubernetes import client as k8s_client, config as k8s_config
         from kubernetes.client.rest import ApiException
         
         try:
-            config.load_incluster_config()
+            k8s_config.load_incluster_config()
         except:
-            config.load_kube_config()
+            k8s_config.load_kube_config()
         
-        v1 = client.CoreV1Api()
+        v1 = k8s_client.CoreV1Api()
         namespace = os.getenv("KUBERNETES_NAMESPACE", "zego-ai-platform")
         
-        # Try to find pod by name pattern
+        # Try to find pod by name pattern or label
         pods = v1.list_namespaced_pod(namespace=namespace)
         for pod in pods.items:
-            if pod_name in pod.metadata.name or pod_name in pod.metadata.labels.get("app", ""):
-                return pod.status.phase.lower()  # Running, Pending, Failed, etc.
+            # Match by name or container_name in labels
+            if (pod_name in pod.metadata.name or 
+                pod_name in pod.metadata.labels.get("app", "") or
+                pod_name in pod.metadata.labels.get("container_name", "")):
+                
+                status_phase = pod.status.phase.lower() if pod.status.phase else "unknown"
+                container_id = pod.metadata.uid  # Kubernetes pod UID
+                
+                # Get ready status from container status
+                ready = False
+                restart_count = 0
+                message = ""
+                
+                if pod.status.container_statuses:
+                    # Check if all containers are ready
+                    ready = all(cs.ready for cs in pod.status.container_statuses)
+                    # Get restart count from first container
+                    if pod.status.container_statuses[0]:
+                        restart_count = pod.status.container_statuses[0].restart_count
+                        # Get state message
+                        state = pod.status.container_statuses[0].state
+                        if state.waiting:
+                            message = state.waiting.reason or "Waiting"
+                        elif state.terminated:
+                            message = state.terminated.reason or "Terminated"
+                        elif state.running:
+                            message = "Running"
+                
+                return {
+                    "status": status_phase,
+                    "container_id": container_id,
+                    "ready": ready,
+                    "restart_count": restart_count,
+                    "message": message,
+                    "pod_name": pod.metadata.name
+                }
         
-        return "unknown"
+        return {
+            "status": "not_found",
+            "container_id": None,
+            "ready": False,
+            "restart_count": 0,
+            "message": "Pod not found",
+            "pod_name": None
+        }
     except Exception as e:
         logger.error(f"Error getting pod status: {e}")
-        return "unknown"
+        return {
+            "status": "error",
+            "container_id": None,
+            "ready": False,
+            "restart_count": 0,
+            "message": str(e),
+            "pod_name": None
+        }
+
+
+async def get_pod_status(pod_name: str) -> str:
+    """Get pod status from Kubernetes (simplified, for backward compatibility)"""
+    info = await get_pod_status_and_info(pod_name)
+    return info.get("status", "unknown")
 
 
 # MCP Server endpoints

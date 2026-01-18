@@ -39,6 +39,7 @@ class N8nPodResponse(BaseModel):
     subdomain: str
     url: str
     status: str
+    container_id: Optional[str] = None  # Kubernetes pod UID or container ID
     created_at: datetime
     enabled_nodes: Optional[str] = None  # Comma-separated list
     
