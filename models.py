@@ -29,11 +29,13 @@ class MCPServer(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), unique=True, nullable=False, index=True)
     url = Column(String(500), nullable=True)  # URL of the MCP server
+    api_url = Column(String(500), nullable=True)  # URL where the API (defined in swagger) is hosted
     swagger_file = Column(Text, nullable=True)  # Original swagger file content
     mcp_config = Column(JSON, nullable=True)  # Converted MCP configuration
     status = Column(String(50), default="stopped")  # stopped, running, error
     pod_name = Column(String(200), nullable=True)  # Kubernetes pod name
     service_name = Column(String(200), nullable=True)  # Kubernetes service name
+    litellm_server_id = Column(String(100), nullable=True)  # LiteLLM's server_id for this MCP server
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -67,6 +69,18 @@ class DevelopmentAgent(Base):
     status = Column(String(50), default="stopped")  # stopped, running, error
     pod_name = Column(String(200), nullable=True)  # Kubernetes pod name
     service_name = Column(String(200), nullable=True)  # Kubernetes service name
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class N8nPodApiKey(Base):
+    """n8n Pod API Key model - stores API keys for n8n pods"""
+    __tablename__ = "n8n_pod_api_keys"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    pod_id = Column(Integer, nullable=False, index=True, unique=True)  # References pod-spawner pod ID
+    pod_name = Column(String(200), nullable=False, index=True)  # For easy lookup
+    api_key = Column(String(255), nullable=True)  # n8n API key
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

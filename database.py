@@ -37,7 +37,7 @@ def get_db():
 
 def init_db():
     """Initialize database tables"""
-    from models import User, MCPServer, VoiceAgent, DevelopmentAgent
+    from models import User, MCPServer, VoiceAgent, DevelopmentAgent, N8nPodApiKey
     Base.metadata.create_all(bind=engine)
     
     # Create default admin user if it doesn't exist

@@ -23,11 +23,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from database import get_db, init_db
-from models import User, MCPServer, VoiceAgent, DevelopmentAgent
+from models import User, MCPServer, VoiceAgent, DevelopmentAgent, N8nPodApiKey
 from schemas import (
     UserCreate, UserResponse, UserLogin,
-    N8nPodResponse, N8nPodCreate,
-    MCPServerCreate, MCPServerResponse,
+    N8nPodResponse, N8nPodCreate, N8nPodApiKeyUpdate, WorkflowResponse,
+    MCPServerCreate, MCPServerResponse, MCPServerUpdate,
     VoiceAgentCreate, VoiceAgentResponse,
     DevAgentCreate, DevAgentResponse
 )
@@ -89,7 +89,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        # Increase default expiration to 24 hours for better UX
+        expire = datetime.utcnow() + timedelta(hours=24)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -211,7 +212,10 @@ async def list_n8n_pods(
                 if pods_response.status_code == 200:
                     pods = pods_response.json()
                     for pod in pods:
-                        # Get detailed pod status from Kubernetes
+                        # Only include n8n pods
+                        if pod.get("pod_type") != "n8n":
+                            continue
+                        # Get detailed pod status from Kubernetes first
                         pod_info = await get_pod_status_and_info(pod.get("container_name", ""))
                         
                         # Determine URL based on environment
@@ -234,8 +238,8 @@ async def list_n8n_pods(
                                 pass
                         
                         # Always try to get LoadBalancer hostname from Kubernetes service
+                        service_name = pod.get("container_name", f"n8n-{pod['subdomain']}")
                         try:
-                            service_name = pod.get("container_name", f"n8n-{pod['subdomain']}")
                             # Query Kubernetes API for service
                             from kubernetes import client as k8s_client, config as k8s_config
                             try:
@@ -255,25 +259,63 @@ async def list_n8n_pods(
                                 lb_hostname = service.status.load_balancer.ingress[0].hostname
                                 if lb_hostname:
                                     url = f"http://{lb_hostname}"
+                            # If service type is LoadBalancer but no hostname yet, wait a bit
+                            elif service.spec.type == "LoadBalancer":
+                                # Service is LoadBalancer but hostname not ready yet
+                                # This is OK - it will be available on next refresh
+                                logger.debug(f"LoadBalancer service {service_name} exists but hostname not ready yet")
                         except Exception as e:
-                            logger.debug(f"Could not get LoadBalancer hostname for {service_name}: {e}")
+                            logger.debug(f"Could not get service info for {service_name}: {e}")
                         
-                        # Fallback: Construct URL from domain/env if no LoadBalancer
+                        # Fallback: Construct URL from domain/env if no LoadBalancer (local dev only)
                         if not url:
-                            n8n_base_domain = os.getenv("N8N_BASE_DOMAIN", "localhost")
-                            traefik_port = os.getenv("TRAEFIK_NODEPORT", "30080")
-                            url = f"http://{pod['subdomain']}.n8n.{n8n_base_domain}:{traefik_port}"
+                            aws_region = os.getenv("AWS_REGION")
+                            if not aws_region:
+                                # Only use localhost fallback if not in AWS
+                                n8n_base_domain = os.getenv("N8N_BASE_DOMAIN", "localhost")
+                                traefik_port = os.getenv("TRAEFIK_NODEPORT", "30080")
+                                url = f"http://{pod['subdomain']}.n8n.{n8n_base_domain}:{traefik_port}"
+                            else:
+                                # In AWS but LoadBalancer not ready - return placeholder
+                                url = f"http://{service_name}.pending"
+                        
+                        # Check URL accessibility if we have a valid URL (not pending/loading)
+                        url_accessible = False
+                        if url and not url.endswith(".pending") and "Loading" not in url:
+                            try:
+                                url_accessible = await check_url_accessible(url, timeout=3.0)
+                            except Exception as e:
+                                logger.debug(f"Could not check URL accessibility for {url}: {e}")
+                        
+                        # Get API key from admin portal DB
+                        api_key_record = db.query(N8nPodApiKey).filter(N8nPodApiKey.pod_id == pod["id"]).first()
+                        api_key = api_key_record.api_key if api_key_record else None
+                        
+                        # Determine status - only show "running" if pod is ready AND URL is accessible
+                        status = pod_info.get("status", "unknown")
+                        aws_region = os.getenv("AWS_REGION")
+                        if aws_region and (not url or "pending" in url):
+                            # In AWS and LoadBalancer not ready - show as pending
+                            status = "pending"
+                        elif status == "running" and not pod_info.get("ready", False):
+                            # Pod is running but not ready yet
+                            status = "pending"
+                        elif status == "running" and url and not url.endswith(".pending") and "Loading" not in url:
+                            # Pod is running but URL not accessible - show as pending until URL is accessible
+                            if not url_accessible:
+                                status = "pending"
                         
                         pods_list.append({
                             "id": pod["id"],
                             "name": pod["name"],
                             "department_name": dept["name"],
                             "subdomain": pod["subdomain"],
-                            "url": url,
-                            "status": pod_info.get("status", "unknown"),
+                            "url": url if not url.endswith(".pending") else "Loading...",
+                            "status": status,
                             "container_id": pod_info.get("container_id"),
                             "created_at": pod["created_at"],
-                            "enabled_nodes": pod.get("nodes_exclude", "")
+                            "enabled_nodes": pod.get("nodes_exclude", ""),
+                            "api_key": api_key
                         })
             
             return pods_list
@@ -293,7 +335,8 @@ async def create_n8n_pod(
     pod_spawner_url = os.getenv("POD_SPAWNER_URL", "http://zego-pod-spawner:4005")
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # Increased timeout to 120 seconds to allow for LoadBalancer provisioning
+        async with httpx.AsyncClient(timeout=120.0) as client:
             # First create department if it doesn't exist
             dept_response = await client.post(
                 f"{pod_spawner_url}/api/v1/departments",
@@ -319,10 +362,68 @@ async def create_n8n_pod(
             spawn_response.raise_for_status()
             result = spawn_response.json()
             
-            # Ensure URL includes port number if missing
-            if "url" in result and ":30080" not in result.get("url", ""):
-                traefik_port = os.getenv("TRAEFIK_NODEPORT", "30080")
-                result["url"] = f"{result['url']}:{traefik_port}"
+            # Wait for LoadBalancer URL if in AWS
+            pod_id = result.get("pod_id")
+            container_name = result.get("container_name", "")
+            aws_region = os.getenv("AWS_REGION")
+            
+            if aws_region and pod_id:
+                # Poll for LoadBalancer hostname (with shorter timeout to avoid blocking)
+                import asyncio
+                max_attempts = 10  # Reduced from 30 - don't wait too long, URL will be fetched on list
+                for attempt in range(max_attempts):
+                    try:
+                        # Query Kubernetes service for LoadBalancer hostname
+                        from kubernetes import client as k8s_client, config as k8s_config
+                        try:
+                            k8s_config.load_incluster_config()
+                        except:
+                            k8s_config.load_kube_config()
+                        v1 = k8s_client.CoreV1Api()
+                        namespace = os.getenv("KUBERNETES_NAMESPACE", "zego-ai-platform")
+                        service = v1.read_namespaced_service(
+                            name=container_name,
+                            namespace=namespace
+                        )
+                        if (service.status.load_balancer and 
+                            service.status.load_balancer.ingress and 
+                            len(service.status.load_balancer.ingress) > 0):
+                            lb_hostname = service.status.load_balancer.ingress[0].hostname
+                            if lb_hostname:
+                                result["url"] = f"http://{lb_hostname}"
+                                break
+                    except Exception as e:
+                        logger.debug(f"Waiting for LoadBalancer (attempt {attempt + 1}/{max_attempts}): {e}")
+                    await asyncio.sleep(2)
+            
+            # If still no LoadBalancer URL, use the URL from pod-spawner (or construct fallback)
+            if not result.get("url") or "localhost" in result.get("url", ""):
+                # Try to get from list endpoint which has better URL logic
+                pods_response = await client.get(f"{pod_spawner_url}/api/v1/pods/{pod_id}")
+                if pods_response.status_code == 200:
+                    pod_data = pods_response.json()
+                    # Get URL using same logic as list endpoint
+                    service_name = pod_data.get("container_name", container_name)
+                    try:
+                        from kubernetes import client as k8s_client, config as k8s_config
+                        try:
+                            k8s_config.load_incluster_config()
+                        except:
+                            k8s_config.load_kube_config()
+                        v1 = k8s_client.CoreV1Api()
+                        namespace = os.getenv("KUBERNETES_NAMESPACE", "zego-ai-platform")
+                        service = v1.read_namespaced_service(
+                            name=service_name,
+                            namespace=namespace
+                        )
+                        if (service.status.load_balancer and 
+                            service.status.load_balancer.ingress and 
+                            len(service.status.load_balancer.ingress) > 0):
+                            lb_hostname = service.status.load_balancer.ingress[0].hostname
+                            if lb_hostname:
+                                result["url"] = f"http://{lb_hostname}"
+                    except Exception:
+                        pass
             
             return {
                 "message": "Pod created successfully",
@@ -376,6 +477,45 @@ async def get_n8n_pod_status(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.patch("/api/n8n-pods/{pod_id}/api-key")
+async def update_n8n_pod_api_key(
+    pod_id: int,
+    api_key_update: N8nPodApiKeyUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update API key for an n8n pod"""
+    # Get pod name from pod-spawner for reference
+    import httpx
+    pod_spawner_url = os.getenv("POD_SPAWNER_URL", "http://zego-pod-spawner:4005")
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            pod_response = await client.get(f"{pod_spawner_url}/api/v1/pods/{pod_id}")
+            if pod_response.status_code != 200:
+                raise HTTPException(status_code=404, detail="Pod not found")
+            pod_data = pod_response.json()
+            pod_name = pod_data.get("name", "")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    
+    # Update or create API key record
+    api_key_record = db.query(N8nPodApiKey).filter(N8nPodApiKey.pod_id == pod_id).first()
+    if api_key_record:
+        api_key_record.api_key = api_key_update.api_key
+        api_key_record.pod_name = pod_name
+    else:
+        api_key_record = N8nPodApiKey(
+            pod_id=pod_id,
+            pod_name=pod_name,
+            api_key=api_key_update.api_key
+        )
+        db.add(api_key_record)
+    
+    db.commit()
+    return {"message": "API key updated successfully", "pod_id": pod_id}
+
+
 @app.delete("/api/n8n-pods/{pod_id}")
 async def delete_n8n_pod(
     pod_id: int,
@@ -393,6 +533,11 @@ async def delete_n8n_pod(
                 f"{pod_spawner_url}/api/v1/pods/{pod_id}"
             )
             if delete_response.status_code in [200, 204]:
+                # Also delete API key record
+                api_key_record = db.query(N8nPodApiKey).filter(N8nPodApiKey.pod_id == pod_id).first()
+                if api_key_record:
+                    db.delete(api_key_record)
+                    db.commit()
                 return {"message": "Pod deleted successfully"}
             elif delete_response.status_code == 404:
                 raise HTTPException(status_code=404, detail="Pod not found")
@@ -408,11 +553,332 @@ async def delete_n8n_pod(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/n8n-pods/{pod_id}/users")
+async def get_n8n_pod_users(
+    pod_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get list of users from a specific n8n pod"""
+    import httpx
+    
+    pod_spawner_url = os.getenv("POD_SPAWNER_URL", "http://zego-pod-spawner:4005")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get pod details
+            pod_response = await client.get(f"{pod_spawner_url}/api/v1/pods/{pod_id}")
+            if pod_response.status_code != 200:
+                raise HTTPException(status_code=404, detail="Pod not found")
+            
+            pod_data = pod_response.json()
+            subdomain = pod_data.get("subdomain")
+            container_name = pod_data.get("container_name", f"n8n-{subdomain}")
+            
+            # Get API key from admin portal DB
+            api_key_record = db.query(N8nPodApiKey).filter(N8nPodApiKey.pod_id == pod_id).first()
+            if not api_key_record or not api_key_record.api_key:
+                raise HTTPException(status_code=400, detail="API key not set for this pod. Please set it first.")
+            
+            # Get users from n8n API
+            n8n_api_url = f"http://{container_name}:80"
+            users_response = await client.get(
+                f"{n8n_api_url}/api/v1/users",
+                headers={"X-N8N-API-KEY": api_key_record.api_key},
+                timeout=10.0
+            )
+            
+            if users_response.status_code != 200:
+                raise HTTPException(
+                    status_code=users_response.status_code,
+                    detail=f"Failed to fetch users from n8n: {users_response.text}"
+                )
+            
+            users_data = users_response.json()
+            users = users_data.get("data", [])
+            
+            # Format users for frontend
+            formatted_users = [
+                {
+                    "id": user.get("id"),
+                    "email": user.get("email"),
+                    "firstName": user.get("firstName", ""),
+                    "lastName": user.get("lastName", ""),
+                    "isOwner": user.get("isOwner", False)
+                }
+                for user in users
+            ]
+            
+            return {"users": formatted_users}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching n8n pod users: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch users: {str(e)}")
+
+
+@app.post("/api/workflow-generation")
+async def generate_workflow(
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Generate a workflow from description and push it to a specific n8n pod"""
+    import httpx
+    
+    pod_id = request.get("pod_id")
+    description = request.get("description")
+    workflow_name = request.get("workflow_name")
+    
+    if not pod_id or not description:
+        raise HTTPException(status_code=400, detail="pod_id and description are required")
+    
+    # Get pod info from pod-spawner
+    pod_spawner_url = os.getenv("POD_SPAWNER_URL", "http://zego-pod-spawner:4005")
+    workflow_api_url = os.getenv("WORKFLOW_API_URL", "http://zego-workflow-api:4009")
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Get pod details
+            pod_response = await client.get(f"{pod_spawner_url}/api/v1/pods/{pod_id}")
+            if pod_response.status_code != 200:
+                raise HTTPException(status_code=404, detail="Pod not found")
+            
+            pod_data = pod_response.json()
+            subdomain = pod_data.get("subdomain")
+            
+            if not subdomain:
+                raise HTTPException(status_code=400, detail="Pod subdomain not found")
+            
+            # Get pod URL (LoadBalancer URL in AWS)
+            pod_url = None
+            try:
+                from kubernetes import client as k8s_client, config as k8s_config
+                try:
+                    k8s_config.load_incluster_config()
+                except:
+                    k8s_config.load_kube_config()
+                v1 = k8s_client.CoreV1Api()
+                namespace = os.getenv("KUBERNETES_NAMESPACE", "zego-ai-platform")
+                container_name = pod_data.get("container_name", f"n8n-{subdomain}")
+                service = v1.read_namespaced_service(
+                    name=container_name,
+                    namespace=namespace
+                )
+                if (service.status.load_balancer and 
+                    service.status.load_balancer.ingress and 
+                    len(service.status.load_balancer.ingress) > 0):
+                    lb_hostname = service.status.load_balancer.ingress[0].hostname
+                    pod_url = f"http://{lb_hostname}"
+            except Exception as e:
+                logger.warning(f"Could not get LoadBalancer URL: {e}")
+                # Fallback to constructing URL
+                pod_url = f"http://{subdomain}.n8n.localhost"
+            
+            # Get API key from admin portal DB
+            api_key_record = db.query(N8nPodApiKey).filter(N8nPodApiKey.pod_id == pod_id).first()
+            if not api_key_record or not api_key_record.api_key:
+                raise HTTPException(status_code=400, detail="API key not set for this pod. Please set it first.")
+            
+            # Get user emails from request (default to current user if not provided)
+            user_emails = request.get("user_emails", [current_user.email])
+            if not isinstance(user_emails, list):
+                user_emails = [user_emails]
+            
+            # Call workflow-api to generate workflow
+            workflow_request = {
+                "description": description,
+                "user_emails": user_emails,
+                "workflow_name": workflow_name,
+                "subdomain": subdomain,
+                "api_key": api_key_record.api_key  # Pass API key from admin portal DB
+            }
+            
+            # Debug logging
+            logger.info(f"DEBUG: Sending workflow request - subdomain: {subdomain}, api_key length: {len(api_key_record.api_key) if api_key_record.api_key else 0}, pod_id: {pod_id}")
+            logger.info(f"DEBUG: Workflow request keys: {list(workflow_request.keys())}")
+            
+            workflow_response = await client.post(
+                f"{workflow_api_url}/api/v1/workflows/create",
+                json=workflow_request,
+                timeout=120.0  # Workflow generation can take time
+            )
+            
+            if workflow_response.status_code != 201:
+                error_detail = workflow_response.text
+                raise HTTPException(
+                    status_code=workflow_response.status_code,
+                    detail=f"Workflow generation failed: {error_detail}"
+                )
+            
+            workflow_data = workflow_response.json()
+            
+            # Construct the public workflow URL
+            workflow_id = workflow_data.get("workflow_id")
+            public_workflow_url = f"{pod_url}/workflow/{workflow_id}"
+            
+            # Construct curl command
+            is_webhook = "/webhook/" in workflow_data.get("workflow_url", "")
+            method = "POST" if is_webhook else "GET"
+            curl_command = f'curl -X {method} "{public_workflow_url}" -H "X-N8N-API-KEY: {api_key_record.api_key}"'
+            
+            return {
+                "success": True,
+                "workflow_id": workflow_id,
+                "workflow_url": public_workflow_url,
+                "workflow_name": workflow_data.get("summary", "").split(":")[0] if workflow_data.get("summary") else workflow_name or "Unnamed",
+                "summary": workflow_data.get("summary", ""),
+                "nodes_used": workflow_data.get("nodes_used", []),
+                "curl_command": curl_command
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate workflow: {str(e)}")
+
+
+@app.get("/api/n8n-workflows", response_model=List[WorkflowResponse])
+async def list_n8n_workflows(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List all workflows from all n8n instances that have API keys"""
+    import httpx
+    from datetime import datetime
+    
+    # Get all pods with API keys
+    api_key_records = db.query(N8nPodApiKey).filter(N8nPodApiKey.api_key.isnot(None)).all()
+    
+    # Get pod details from pod-spawner
+    pod_spawner_url = os.getenv("POD_SPAWNER_URL", "http://zego-pod-spawner:4005")
+    workflows_list = []
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for api_key_record in api_key_records:
+                try:
+                    # Get pod info
+                    pod_response = await client.get(f"{pod_spawner_url}/api/v1/pods/{api_key_record.pod_id}")
+                    if pod_response.status_code != 200:
+                        continue
+                    pod_data = pod_response.json()
+                    
+                    # Get pod URL
+                    container_name = pod_data.get("container_name", "")
+                    pod_url = None
+                    
+                    # Try to get LoadBalancer URL
+                    try:
+                        from kubernetes import client as k8s_client, config as k8s_config
+                        try:
+                            k8s_config.load_incluster_config()
+                        except:
+                            k8s_config.load_kube_config()
+                        v1 = k8s_client.CoreV1Api()
+                        namespace = os.getenv("KUBERNETES_NAMESPACE", "zego-ai-platform")
+                        service = v1.read_namespaced_service(
+                            name=container_name,
+                            namespace=namespace
+                        )
+                        if (service.status.load_balancer and 
+                            service.status.load_balancer.ingress and 
+                            len(service.status.load_balancer.ingress) > 0):
+                            lb_hostname = service.status.load_balancer.ingress[0].hostname
+                            if lb_hostname:
+                                pod_url = f"http://{lb_hostname}"
+                    except Exception:
+                        pass
+                    
+                    if not pod_url:
+                        n8n_base_domain = os.getenv("N8N_BASE_DOMAIN", "localhost")
+                        traefik_port = os.getenv("TRAEFIK_NODEPORT", "30080")
+                        pod_url = f"http://{pod_data.get('subdomain', '')}.n8n.{n8n_base_domain}:{traefik_port}"
+                    
+                    # Get container ID
+                    pod_info = await get_pod_status_and_info(container_name)
+                    container_id = pod_info.get("container_id")
+                    
+                    # Fetch workflows from n8n API
+                    n8n_api_url = f"{pod_url}/api/v1/workflows"
+                    headers = {"X-N8N-API-KEY": api_key_record.api_key}
+                    workflows_response = await client.get(n8n_api_url, headers=headers, timeout=10.0)
+                    
+                    if workflows_response.status_code == 200:
+                        workflows_data = workflows_response.json()
+                        if isinstance(workflows_data, dict) and "data" in workflows_data:
+                            workflows = workflows_data["data"]
+                        elif isinstance(workflows_data, list):
+                            workflows = workflows_data
+                        else:
+                            workflows = []
+                        
+                        for workflow in workflows:
+                            # Get webhook URL if available
+                            workflow_url = None
+                            if "nodes" in workflow:
+                                for node in workflow.get("nodes", []):
+                                    if node.get("type") == "n8n-nodes-base.webhook":
+                                        webhook_path = node.get("parameters", {}).get("path", "")
+                                        if webhook_path:
+                                            workflow_url = f"{pod_url}/webhook/{webhook_path}"
+                                            break
+                            
+                            # Parse dates
+                            created_at = None
+                            updated_at = None
+                            if workflow.get("createdAt"):
+                                try:
+                                    created_at = datetime.fromisoformat(workflow["createdAt"].replace("Z", "+00:00"))
+                                except:
+                                    pass
+                            if workflow.get("updatedAt"):
+                                try:
+                                    updated_at = datetime.fromisoformat(workflow["updatedAt"].replace("Z", "+00:00"))
+                                except:
+                                    pass
+                            
+                            workflows_list.append({
+                                "id": str(workflow.get("id", "")),
+                                "name": workflow.get("name", "Unnamed Workflow"),
+                                "url": workflow_url or f"{pod_url}/workflow/{workflow.get('id', '')}",
+                                "container_id": container_id,
+                                "created_at": created_at,
+                                "updated_at": updated_at,
+                                "owner": workflow.get("nodes", [{}])[0].get("parameters", {}).get("owner", None) if workflow.get("nodes") else None,
+                                "active": workflow.get("active", False),
+                                "pod_name": api_key_record.pod_name,
+                                "pod_id": api_key_record.pod_id
+                            })
+                except Exception as e:
+                    logger.error(f"Error fetching workflows for pod {api_key_record.pod_id}: {e}")
+                    continue
+        
+        return workflows_list
+    except Exception as e:
+        logger.error(f"Error fetching n8n workflows: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def check_url_accessible(url: str, timeout: float = 5.0) -> bool:
+    """Check if a URL is accessible via HTTP GET"""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url)
+            # Consider 2xx, 3xx, and 401/403 (login pages) as accessible
+            return response.status_code < 500
+    except Exception:
+        return False
+
+
 async def get_pod_status_and_info(pod_name: str) -> dict:
     """Get pod status and detailed info from Kubernetes
     
     Returns:
-        dict with keys: status, container_id, ready, restart_count, message
+        dict with keys: status, container_id, ready, restart_count, message, url_accessible
     """
     try:
         from kubernetes import client as k8s_client, config as k8s_config
@@ -441,6 +907,7 @@ async def get_pod_status_and_info(pod_name: str) -> dict:
                 ready = False
                 restart_count = 0
                 message = ""
+                url_accessible = False
                 
                 if pod.status.container_statuses:
                     # Check if all containers are ready
@@ -463,7 +930,8 @@ async def get_pod_status_and_info(pod_name: str) -> dict:
                     "ready": ready,
                     "restart_count": restart_count,
                     "message": message,
-                    "pod_name": pod.metadata.name
+                    "pod_name": pod.metadata.name,
+                    "url_accessible": url_accessible  # Will be set by caller with URL check
                 }
         
         return {
@@ -472,7 +940,8 @@ async def get_pod_status_and_info(pod_name: str) -> dict:
             "ready": False,
             "restart_count": 0,
             "message": "Pod not found",
-            "pod_name": None
+            "pod_name": None,
+            "url_accessible": False
         }
     except Exception as e:
         logger.error(f"Error getting pod status: {e}")
@@ -482,7 +951,8 @@ async def get_pod_status_and_info(pod_name: str) -> dict:
             "ready": False,
             "restart_count": 0,
             "message": str(e),
-            "pod_name": None
+            "pod_name": None,
+            "url_accessible": False
         }
 
 
@@ -498,8 +968,35 @@ async def list_mcp_servers(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all MCP servers"""
+    """List all MCP servers with updated status from Kubernetes"""
     servers = db.query(MCPServer).all()
+    
+    # Update status based on actual pod status
+    for server in servers:
+        if server.pod_name:
+            try:
+                pod_info = await get_pod_status_and_info(server.pod_name)
+                pod_status = pod_info.get("status", "unknown")
+                
+                # Map Kubernetes status to our status
+                if pod_status == "running" and pod_info.get("ready", False):
+                    new_status = "running"
+                elif pod_status in ["pending", "containercreating"]:
+                    new_status = "pending"
+                elif pod_status in ["error", "crashloopbackoff", "imagepullbackoff"]:
+                    new_status = "error"
+                else:
+                    new_status = pod_status
+                
+                # Update database if status changed
+                if server.status != new_status:
+                    server.status = new_status
+                    db.commit()
+                    db.refresh(server)
+            except Exception as e:
+                logger.error(f"Error checking pod status for {server.pod_name}: {e}")
+                # Keep existing status if check fails
+    
     return servers
 
 
@@ -546,7 +1043,8 @@ async def create_mcp_server(
                     "department_id": department_id,
                     "name": server.name,
                     "subdomain": subdomain,
-                    "swagger_file": server.swagger_file
+                    "swagger_file": server.swagger_file,
+                    "api_url": server.api_url  # Pass API URL where swagger API is hosted
                 }
             )
             spawn_response.raise_for_status()
@@ -563,29 +1061,106 @@ async def create_mcp_server(
             internal_url = f"http://{mcp_service_name}:8000"
             
             try:
+                # Register with mcp-litellm-sync
+                # Note: subdomain may contain hyphens, but LiteLLM database requires underscores
+                # mcp-litellm-sync will handle the conversion
                 register_response = await client.post(
                     f"{mcp_sync_url}/register",
                     json={
-                        "name": subdomain,  # Use subdomain as MCP server name
+                        "name": subdomain,  # Use subdomain as MCP server name (may contain hyphens)
                         "url": mcp_url,  # External URL
-                        "internal_url": internal_url  # Internal cluster URL
+                        "internal_url": internal_url,  # Internal cluster URL
+                        "api_key": os.getenv("LITELLM_MASTER_KEY", "sk-1234"),  # Use master key for auth
+                        "db_name": subdomain.replace("-", "_")  # Database-friendly name (underscores)
                     },
                     timeout=30.0
                 )
                 register_response.raise_for_status()
-                logger.info(f"Registered MCP server '{subdomain}' with LiteLLM")
+                register_result = register_response.json()
+                logger.info(f"Registered MCP server '{subdomain}' with LiteLLM: {register_result}")
+                
+                # Extract LiteLLM server_id from registration response if available
+                litellm_server_id = None
+                if isinstance(register_result, dict):
+                    # Try different possible response formats
+                    litellm_server_id = register_result.get("server_id") or register_result.get("id") or register_result.get("data", {}).get("server_id")
             except Exception as reg_error:
-                logger.warning(f"Failed to register MCP server with LiteLLM (non-fatal): {reg_error}")
+                logger.error(f"Failed to register MCP server with LiteLLM: {reg_error}", exc_info=True)
                 # Continue even if registration fails - pod is still created
+                # Note: Registration can be retried or done manually via LiteLLM UI
+                litellm_server_id = None
             
-            # Store in admin portal DB - set status based on result
+            # Store in admin portal DB - set status based on actual pod status
+            # Wait a bit for pod to start, then check status with retries
+            import asyncio
+            pod_status = "pending"
+            if result.get("success"):
+                pod_name = result.get("container_name", "")
+                if pod_name:
+                    # Wait 5 seconds for pod to start initializing
+                    await asyncio.sleep(5)
+                    
+                    # Check pod status with retries (pods take time to become ready)
+                    max_retries = 6  # Check for up to 30 seconds (6 * 5s)
+                    for attempt in range(max_retries):
+                        try:
+                            pod_info = await get_pod_status_and_info(pod_name)
+                            k8s_status = pod_info.get("status", "unknown")
+                            ready = pod_info.get("ready", False)
+                            
+                            # Map Kubernetes status to our status
+                            if k8s_status == "running" and ready:
+                                # Verify health by checking MCP server health endpoint
+                                try:
+                                    health_url = f"{internal_url}/health"
+                                    async with httpx.AsyncClient(timeout=5.0) as health_client:
+                                        health_response = await health_client.get(health_url)
+                                        if health_response.status_code == 200:
+                                            pod_status = "running"
+                                            break
+                                        else:
+                                            logger.warning(f"MCP server health check failed: {health_response.status_code}")
+                                except Exception as health_error:
+                                    logger.warning(f"Could not verify MCP server health: {health_error}")
+                                    # Still mark as running if pod is ready (health check might be timing out)
+                                    if attempt >= 3:  # After 15 seconds, accept pod as running even if health check fails
+                                        pod_status = "running"
+                                        break
+                            elif k8s_status in ["error", "crashloopbackoff", "imagepullbackoff"]:
+                                pod_status = "error"
+                                break
+                            elif k8s_status in ["pending", "containercreating"]:
+                                # Still starting, wait and retry
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(5)
+                                    continue
+                                else:
+                                    pod_status = "pending"
+                                    break
+                            else:
+                                pod_status = k8s_status
+                                break
+                        except Exception as status_error:
+                            logger.warning(f"Could not check pod status (attempt {attempt + 1}): {status_error}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(5)
+                            else:
+                                pod_status = "pending"
+                                break
+                else:
+                    pod_status = "pending"
+            else:
+                pod_status = "error"
+            
             db_server = MCPServer(
                 name=server.name,
                 swagger_file=server.swagger_file,
+                api_url=server.api_url,  # Store the API URL where swagger API is hosted
                 url=mcp_url,
-                status="running" if result.get("success") else "error",
+                status=pod_status,
                 pod_name=result.get("container_name", ""),
-                service_name=result.get("container_name", "")
+                service_name=result.get("service_name", result.get("container_name", "")),
+                litellm_server_id=litellm_server_id  # Store LiteLLM's server_id
             )
             db.add(db_server)
             db.commit()
@@ -600,6 +1175,56 @@ async def create_mcp_server(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/mcp-servers/{server_id}")
+async def get_mcp_server(
+    server_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get a single MCP server with full details including swagger_file"""
+    server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    
+    return {
+        "id": server.id,
+        "name": server.name,
+        "url": server.url,
+        "api_url": server.api_url,
+        "swagger_file": server.swagger_file,
+        "status": server.status,
+        "created_at": server.created_at
+    }
+
+
+@app.patch("/api/mcp-servers/{server_id}", response_model=MCPServerResponse)
+async def update_mcp_server(
+    server_id: int,
+    server_update: MCPServerUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update an MCP server's API URL and/or swagger file"""
+    server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    
+    # Update fields if provided
+    if server_update.api_url is not None:
+        server.api_url = server_update.api_url
+    
+    if server_update.swagger_file is not None:
+        server.swagger_file = server_update.swagger_file
+        # TODO: If swagger is updated, we might want to re-convert and update the MCP config
+        # For now, just update the stored swagger file
+    
+    server.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(server)
+    
+    return server
+
+
 @app.delete("/api/mcp-servers/{server_id}")
 async def delete_mcp_server(
     server_id: int,
@@ -611,6 +1236,23 @@ async def delete_mcp_server(
     server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
     if not server:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    
+    # Unregister from LiteLLM first
+    mcp_sync_url = os.getenv("MCP_LITELLM_SYNC_URL", "http://mcp-litellm-sync:4008")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Use server_id if available (more reliable), otherwise fall back to name
+            unregister_url = f"{mcp_sync_url}/unregister/{server.name}"
+            if server.litellm_server_id:
+                unregister_url += f"?server_id={server.litellm_server_id}"
+            unregister_response = await client.delete(unregister_url)
+            if unregister_response.status_code == 200:
+                logger.info(f"Unregistered MCP server '{server.name}' from LiteLLM")
+            else:
+                logger.warning(f"Failed to unregister MCP server from LiteLLM: {unregister_response.text}")
+    except Exception as unreg_error:
+        logger.error(f"Error unregistering MCP server from LiteLLM: {unreg_error}")
+        # Continue with deletion even if unregistration fails
     
     # Delete pod via pod-spawner if pod_name exists
     if server.pod_name:
